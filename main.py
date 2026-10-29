@@ -1,78 +1,69 @@
-import uvicorn
-from fastapi import FastAPI, HTTPException, status
+import asyncio
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from transformers import pipeline
 
-# 1. Initialize the FastAPI Application
 app = FastAPI(
-    title="Async AI Sentiment Analysis API",
-    description="A production-ready FastAPI wrapper around Hugging Face Transformers.",
+    title="Production-Ready AI Sentiment Analysis API",
+    description="Asynchronous backend service utilizing Hugging Face transformers.",
     version="1.0.0"
 )
 
-# 2. Load the ML Model locally on startup (Using a fast, lightweight DistilBERT model)
-print("Loading Machine Learning model pipeline...")
+# Initialize the Hugging Face pipeline globally
+# For production efficiency, this loads into memory once when the server starts
 try:
-    sentiment_model = pipeline(
-        "sentiment-analysis", 
-        model="distilbert-base-uncased-finetuned-sst-2-english"
-    )
-    print("Model loaded successfully!")
+    sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    sentiment_model = None
+    raise RuntimeError(f"Failed to load Hugging Face model: {str(e)}")
 
-# 3. Define the strict Data Input Schema using Pydantic
-class AnalysisRequest(BaseModel):
+# Define input validation schema using Pydantic
+class SentimentRequest(BaseModel):
     text: str = Field(
         ..., 
-        min_length=3, 
-        max_length=1000, 
-        description="The raw text content to analyze for sentiment.",
-        example="FastAPI and Machine Learning integration works beautifully!"
+        min_length=1, 
+        max_length=500, 
+        description="The raw text payload to analyze for emotional sentiment."
     )
 
-# 4. Define the Data Output Schema for clean API documentation
-class AnalysisResponse(BaseModel):
-    status: str
-    text_analyzed: str
-    sentiment: str
-    confidence_score: float
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "text": "Classroom theory is great, but production code hits differently!"
+            }
+        }
 
-# 5. Create the Core API Endpoints
-@app.get("/", tags=["Health Check"])
-async def root():
-    """Simple health-check endpoint to verify backend status."""
-    return {"status": "online", "message": "AI Sentiment Backend is active."}
+# Define output validation schema
+class SentimentResponse(BaseModel):
+    text: str
+    label: str
+    score: float
 
-@app.post("/api/v1/analyze", response_model=AnalysisResponse, tags=["ML Inference"])
-async def analyze_sentiment(payload: AnalysisRequest):
+@app.get("/health", tags=["System"])
+async def health_check():
+    """System health check endpoint to confirm backend readiness."""
+    return {"status": "healthy", "model_loaded": True}
+
+@app.post("/api/v1/analyze", response_model=SentimentResponse, tags=["AI Inference"])
+async def analyze_sentiment(payload: SentimentRequest):
     """
-    Accepts text payload, feeds it directly to the local ML pipeline,
-    and returns a structured json analysis.
+    Parses input text data and runs machine learning sentiment analysis.
+    Uses asyncio.to_thread to offload the heavy synchronous ML pipeline execution
+    to a separate worker thread, ensuring the main FastAPI event loop remains unblocked.
     """
-    if not sentiment_model:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="ML Model pipeline is currently unavailable on the host system."
-        )
-    
     try:
-        # Run inference through the pipeline
-        model_output = sentiment_model(payload.text)[0]
+        # Offload the blocking model inference to a worker thread
+        prediction = await asyncio.to_thread(sentiment_pipeline, payload.text)
         
-        return AnalysisResponse(
-            status="success",
-            text_analyzed=payload.text,
-            sentiment=model_output["label"],
-            confidence_score=round(float(model_output["score"]), 4)
+        # Parse the raw results out of the pipeline response list
+        result = prediction[0]
+        
+        return SentimentResponse(
+            text=payload.text,
+            label=result["label"],
+            score=round(result["score"], 4)
         )
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"An error occurred during model inference: {str(e)}"
+            status_code=500, 
+            detail=f"Inference error during model execution: {str(e)}"
         )
-
-# 6. Local Server Execution block
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
